@@ -248,6 +248,8 @@ bool PoolReplayer<I>::is_running() const {
 
 template <typename I>
 void PoolReplayer<I>::init(const std::string& site_name) {
+  std::lock_guard locker{m_lock};
+
   ceph_assert(!m_pool_replayer_thread.is_started());
 
   // reset state
@@ -398,8 +400,6 @@ int PoolReplayer<I>::init_rados(const std::string &cluster_name,
 			        const std::string &description,
 			        RadosRef *rados_ref,
                                 bool strip_cluster_overrides) {
-  rados_ref->reset(new librados::Rados());
-
   // NOTE: manually bootstrap a CephContext here instead of via
   // the librados API to avoid mixing global singletons between
   // the librados shared library and the daemon
@@ -501,6 +501,8 @@ int PoolReplayer<I>::init_rados(const std::string &cluster_name,
   cct->_conf.set_val_or_die("rbd_cache", "false");
   cct->_conf.apply_changes(nullptr);
   cct->_conf.complain_about_parse_error(cct);
+
+  rados_ref->reset(new librados::Rados());
 
   r = (*rados_ref)->init_with_context(cct);
   ceph_assert(r == 0);
@@ -698,6 +700,19 @@ int PoolReplayer<I>::list_mirroring_namespaces(
 }
 
 template <typename I>
+void PoolReplayer<I>::reopen_logs()
+{
+  std::lock_guard locker{m_lock};
+
+  if (m_local_rados) {
+    reinterpret_cast<CephContext *>(m_local_rados->cct())->reopen_logs();
+  }
+  if (m_remote_rados) {
+    reinterpret_cast<CephContext *>(m_remote_rados->cct())->reopen_logs();
+  }
+}
+
+template <typename I>
 void PoolReplayer<I>::namespace_replayer_acquire_leader(const std::string &name,
                                                         Context *on_finish) {
   ceph_assert(ceph_mutex_is_locked(m_lock));
@@ -751,31 +766,39 @@ void PoolReplayer<I>::print_status(Formatter *f) {
     state = "stopped (manual)";
   } else if (m_stopping) {
     state = "stopped";
+  } else if (!is_running()) {
+    state = "error";
   }
   f->dump_string("state", state);
 
-  std::string leader_instance_id;
-  m_leader_watcher->get_leader_instance_id(&leader_instance_id);
-  f->dump_string("leader_instance_id", leader_instance_id);
+  if (m_leader_watcher) {
+    std::string leader_instance_id;
+    m_leader_watcher->get_leader_instance_id(&leader_instance_id);
+    f->dump_string("leader_instance_id", leader_instance_id);
 
-  bool leader = m_leader_watcher->is_leader();
-  f->dump_bool("leader", leader);
-  if (leader) {
-    std::vector<std::string> instance_ids;
-    m_leader_watcher->list_instances(&instance_ids);
-    f->open_array_section("instances");
-    for (auto instance_id : instance_ids) {
-      f->dump_string("instance_id", instance_id);
+    bool leader = m_leader_watcher->is_leader();
+    f->dump_bool("leader", leader);
+    if (leader) {
+      std::vector<std::string> instance_ids;
+      m_leader_watcher->list_instances(&instance_ids);
+      f->open_array_section("instances");
+      for (auto instance_id : instance_ids) {
+        f->dump_string("instance_id", instance_id);
+      }
+      f->close_section(); // instances
     }
-    f->close_section(); // instances
   }
 
-  f->dump_string("local_cluster_admin_socket",
-                 reinterpret_cast<CephContext *>(m_local_io_ctx.cct())->_conf.
-                     get_val<std::string>("admin_socket"));
-  f->dump_string("remote_cluster_admin_socket",
-                 reinterpret_cast<CephContext *>(m_remote_io_ctx.cct())->_conf.
-                     get_val<std::string>("admin_socket"));
+  if (m_local_rados) {
+    auto cct = reinterpret_cast<CephContext *>(m_local_rados->cct());
+    f->dump_string("local_cluster_admin_socket",
+                   cct->_conf.get_val<std::string>("admin_socket"));
+  }
+  if (m_remote_rados) {
+    auto cct = reinterpret_cast<CephContext *>(m_remote_rados->cct());
+    f->dump_string("remote_cluster_admin_socket",
+                   cct->_conf.get_val<std::string>("admin_socket"));
+  }
 
   if (m_image_sync_throttler) {
     f->open_object_section("sync_throttler");
@@ -789,7 +812,9 @@ void PoolReplayer<I>::print_status(Formatter *f) {
     f->close_section(); // deletion_throttler
   }
 
-  m_default_namespace_replayer->print_status(f);
+  if (m_default_namespace_replayer) {
+    m_default_namespace_replayer->print_status(f);
+  }
 
   f->open_array_section("namespaces");
   for (auto &it : m_namespace_replayers) {

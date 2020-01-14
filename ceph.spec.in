@@ -1,4 +1,3 @@
-# vim: set noexpandtab ts=8 sw=8 :
 #
 # spec file for package ceph
 #
@@ -277,18 +276,20 @@ BuildRequires:	lz4-devel >= 1.7
 # distro-conditional make check dependencies
 %if 0%{with make_check}
 %if 0%{?fedora} || 0%{?rhel}
-%if 0%{?fedora} || 0%{?rhel} == 7
 BuildRequires:	libtool-ltdl-devel
-BuildRequires:	python%{python3_pkgversion}-cherrypy
-BuildRequires:	python%{python3_pkgversion}-jwt
-BuildRequires:	python%{python3_pkgversion}-routes
-BuildRequires:	python%{python3_pkgversion}-werkzeug
 BuildRequires:	xmlsec1
 BuildRequires:	xmlsec1-devel
+%ifarch x86_64
 BuildRequires:	xmlsec1-nss
+%endif
 BuildRequires:	xmlsec1-openssl
 BuildRequires:	xmlsec1-openssl-devel
+BuildRequires:	python%{python3_pkgversion}-jwt
+BuildRequires:	python%{python3_pkgversion}-werkzeug
 BuildRequires:  python%{python3_pkgversion}-pyOpenSSL
+%if 0%{?fedora} || 0%{?rhel} == 7
+BuildRequires:	python%{python3_pkgversion}-cherrypy
+BuildRequires:	python%{python3_pkgversion}-routes
 %endif
 %endif
 %if 0%{?suse_version}
@@ -1853,12 +1854,14 @@ fi
 %{_bindir}/radosgw-token
 %{_bindir}/radosgw-es
 %{_bindir}/radosgw-object-expirer
+%{_libdir}/libradosgw.so*
 %{_mandir}/man8/radosgw.8*
 %dir %{_localstatedir}/lib/ceph/radosgw
 %{_unitdir}/ceph-radosgw@.service
 %{_unitdir}/ceph-radosgw.target
 
 %post radosgw
+/sbin/ldconfig
 %if 0%{?suse_version}
 if [ $1 -eq 1 ] ; then
   /usr/bin/systemctl preset ceph-radosgw@\*.service ceph-radosgw.target >/dev/null 2>&1 || :
@@ -1880,6 +1883,7 @@ fi
 %endif
 
 %postun radosgw
+/sbin/ldconfig
 %if 0%{?suse_version}
 DISABLE_RESTART_ON_UPDATE="yes"
 %service_del_postun ceph-radosgw@\*.service ceph-radosgw.target

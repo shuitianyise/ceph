@@ -419,6 +419,32 @@ bool MDSMonitor::preprocess_beacon(MonOpRequestRef op)
     // ignore, already booted.
     goto ignore;
   }
+
+  // did the standby fs change
+  if (info.state == MDSMap::STATE_STANDBY &&
+      state == MDSMap::STATE_STANDBY) {
+    if (m->get_fs().size()) {
+      fs_cluster_id_t fscid = FS_CLUSTER_ID_NONE;
+      auto f = fsmap.get_filesystem(m->get_fs());
+      if (f) {
+	fscid = f->fscid;
+      }
+      auto p = fsmap.standby_daemon_fscid.find(gid);
+      if (p == fsmap.standby_daemon_fscid.end() ||
+	  p->second != fscid) {
+	dout(10) << __func__ << " standby mds_join_fs changed to " << fscid
+		 << " (" << m->get_fs() << ")" << dendl;
+	return false;
+      }
+    } else {
+      auto p = fsmap.standby_daemon_fscid.find(gid);
+      if (p != fsmap.standby_daemon_fscid.end()) {
+	dout(10) << __func__ << " standby mds_join_fs was cleared" << dendl;
+	return false;
+      }
+    }
+  }
+
   // is there a state change here?
   if (info.state != state) {
     // legal state change?
@@ -611,6 +637,14 @@ bool MDSMonitor::prepare_beacon(MonOpRequestRef op)
       new_info.state = MDSMap::STATE_STANDBY;
       new_info.state_seq = seq;
       pending.insert(new_info);
+      if (m->get_fs().size()) {
+	fs_cluster_id_t fscid = FS_CLUSTER_ID_NONE;
+	auto f = pending.get_filesystem(m->get_fs());
+	if (f) {
+	  fscid = f->fscid;
+	}
+	pending.adjust_standby_fscid(gid, fscid);
+      }
     }
 
     // initialize the beacon timer
@@ -772,6 +806,20 @@ bool MDSMonitor::prepare_beacon(MonOpRequestRef op)
         info.state = state;
         info.state_seq = seq;
       });
+
+      // Process standby mds_join_fs change
+      if (state == MDSMap::STATE_STANDBY) {
+	if (m->get_fs().size()) {
+	  fs_cluster_id_t fscid = FS_CLUSTER_ID_NONE;
+	  auto f = pending.get_filesystem(m->get_fs());
+	  if (f) {
+	    fscid = f->fscid;
+	  }
+	  pending.adjust_standby_fscid(gid, fscid);
+	} else {
+	  pending.clear_standby_fscid(gid);
+	}
+      }
     }
   }
 
@@ -1503,29 +1551,33 @@ int MDSMonitor::filesystem_command(
 
 void MDSMonitor::check_subs()
 {
-  std::list<std::string> types;
-
   // Subscriptions may be to "mdsmap" (MDS and legacy clients),
   // "mdsmap.<namespace>", or to "fsmap" for the full state of all
   // filesystems.  Build a list of all the types we service
   // subscriptions for.
-  types.push_back("fsmap");
-  types.push_back("fsmap.user");
-  types.push_back("mdsmap");
+
+  std::vector<std::string> types = {
+    "fsmap",
+    "fsmap.user",
+    "mdsmap",
+  };
+
   for (const auto &p : get_fsmap().filesystems) {
     const auto &fscid = p.first;
-    std::ostringstream oss;
-    oss << "mdsmap." << fscid;
-    types.push_back(oss.str());
+    CachedStackStringStream cos;
+    *cos << "mdsmap." << fscid;
+    types.push_back(std::string(cos->strv()));
   }
 
   for (const auto &type : types) {
-    if (mon->session_map.subs.count(type) == 0)
+    auto& subs = mon->session_map.subs;
+    auto subs_it = subs.find(type);
+    if (subs_it == subs.end())
       continue;
-    xlist<Subscription*>::iterator p = mon->session_map.subs[type]->begin();
-    while (!p.end()) {
-      Subscription *sub = *p;
-      ++p;
+    auto sub_it = subs_it->second->begin();
+    while (!sub_it.end()) {
+      auto sub = *sub_it;
+      ++sub_it; // N.B. check_sub may remove sub!
       check_sub(sub);
     }
   }
@@ -1972,7 +2024,7 @@ bool MDSMonitor::maybe_promote_standby(FSMap &fsmap, Filesystem& fs)
     // as standby-replay daemons. Don't do this when the cluster is degraded
     // as a standby-replay daemon may try to read a journal being migrated.
     for (;;) {
-      auto standby_gid = fsmap.get_available_standby();
+      auto standby_gid = fsmap.get_available_standby(fs.fscid);
       if (standby_gid == MDS_GID_NONE) break;
       dout(20) << "standby available mds." << standby_gid << dendl;
       bool changed = false;

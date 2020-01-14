@@ -9585,19 +9585,6 @@ void OSD::enqueue_peering_evt(spg_t pgid, PGPeeringEventRef evt)
       evt->get_epoch_sent()));
 }
 
-void OSD::enqueue_peering_evt_front(spg_t pgid, PGPeeringEventRef evt)
-{
-  dout(15) << __func__ << " " << pgid << " " << evt->get_desc() << dendl;
-  op_shardedwq.queue_front(
-    OpSchedulerItem(
-      unique_ptr<OpSchedulerItem::OpQueueable>(new PGPeeringItem(pgid, evt)),
-      10,
-      cct->_conf->osd_peering_op_priority,
-      utime_t(),
-      0,
-      evt->get_epoch_sent()));
-}
-
 /*
  * NOTE: dequeue called in worker thread, with pg lock
  */
@@ -10340,8 +10327,7 @@ OSDShard::OSDShard(
     shard_name(string("OSDShard.") + stringify(id)),
     sdata_wait_lock_name(shard_name + "::sdata_wait_lock"),
     sdata_wait_lock{make_mutex(sdata_wait_lock_name)},
-    osdmap_lock_name(shard_name + "::osdmap_lock"),
-    osdmap_lock{make_mutex(osdmap_lock_name)},
+    osdmap_lock{make_mutex(shard_name + "::osdmap_lock")},
     shard_lock_name(shard_name + "::shard_lock"),
     shard_lock{make_mutex(shard_lock_name)},
     scheduler(ceph::osd::scheduler::make_scheduler(cct)),

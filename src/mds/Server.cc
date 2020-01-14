@@ -538,7 +538,7 @@ void Server::handle_client_session(const cref_t<MClientSession> &m)
 
     {
       auto& addr = session->info.inst.addr;
-      session->set_client_metadata(client_metadata_t(m->metadata, m->supported_features));
+      session->set_client_metadata(client_metadata_t(m->metadata, m->supported_features, m->metric_spec));
       auto& client_metadata = session->info.client_metadata;
 
       auto log_session_status = [this, m, session](std::string_view status, std::string_view err) {
@@ -585,7 +585,8 @@ void Server::handle_client_session(const cref_t<MClientSession> &m)
 	infer_supported_features(session, client_metadata);
 
       dout(20) << __func__ << " CEPH_SESSION_REQUEST_OPEN metadata entries:" << dendl;
-      dout(20) << "  features: '" << client_metadata.features << dendl;
+      dout(20) << " features: '" << client_metadata.features << "'" << dendl;
+      dout(20) << " metric specification: [" << client_metadata.metric_spec << "]" << dendl;
       for (const auto& p : client_metadata) {
 	dout(20) << "  " << p.first << ": " << p.second << dendl;
       }
@@ -1303,7 +1304,6 @@ void Server::handle_client_reconnect(const cref_t<MClientReconnect> &m)
   if (!session->is_open()) {
     dout(0) << " ignoring msg from not-open session" << *m << dendl;
     auto reply = make_message<MClientSession>(CEPH_SESSION_CLOSE);
-    reply->metadata["error_string"] = "session is not open";
     mds->send_message(reply, m->get_connection());
     return;
   }
@@ -2185,7 +2185,7 @@ void Server::set_trace_dist(const ref_t<MClientReply> &reply,
     DirStat ds;
     ds.frag = dir->get_frag();
     ds.auth = dir->get_dir_auth().first;
-    if (dir->is_auth())
+    if (dir->is_auth() && !mdcache->forward_all_reqs_to_auth())
       dir->get_dist_spec(ds.dist, whoami);
 
     dir->encode_dirstat(bl, session->info, ds);
@@ -3719,7 +3719,7 @@ void Server::handle_client_getattr(MDRequestRef& mdr, bool is_lookup)
 
   mdr->getattr_caps = mask;
 
-  if (!mdr->is_batch_head && mdr->is_batch_op()) {
+  if (mdr->snapid == CEPH_NOSNAP && !mdr->is_batch_head && mdr->is_batch_op()) {
     if (!is_lookup) {
       auto em = ref->batch_ops.emplace(std::piecewise_construct, std::forward_as_tuple(mask), std::forward_as_tuple());
       if (em.second) {
@@ -3733,15 +3733,16 @@ void Server::handle_client_getattr(MDRequestRef& mdr, bool is_lookup)
       CDentry* dn = mdr->dn[0].back();
       auto em = dn->batch_ops.emplace(std::piecewise_construct, std::forward_as_tuple(mask), std::forward_as_tuple());
       if (em.second) {
-        em.first->second = std::make_unique<Batch_Getattr_Lookup>(this, mdr, mdcache);
+	em.first->second = std::make_unique<Batch_Getattr_Lookup>(this, mdr, mdcache);
+	mdr->pin(dn);
       } else {
 	dout(20) << __func__ << ": LOOKUP op, wait for previous same getattr ops to respond. " << *mdr << dendl;
 	em.first->second->add_request(mdr);
 	return;
       }
     }
+    mdr->is_batch_head = true;
   }
-  mdr->is_batch_head = true;
 
   /*
    * if client currently holds the EXCL cap on a field, do not rdlock
@@ -4491,7 +4492,7 @@ void Server::handle_client_readdir(MDRequestRef& mdr)
   DirStat ds;
   ds.frag = dir->get_frag();
   ds.auth = dir->get_dir_auth().first;
-  if (dir->is_auth())
+  if (dir->is_auth() && !mdcache->forward_all_reqs_to_auth())
     dir->get_dist_spec(ds.dist, mds->get_nodeid());
 
   dir->encode_dirstat(dirbl, mdr->session->info, ds);
